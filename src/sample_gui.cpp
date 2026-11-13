@@ -339,6 +339,7 @@ VkResult Sample::run()
     iniIO.setSetting("editor.showMatchingBrackets", &t.showMatchingBrackets);
     iniIO.setSetting("editor.completePairedGlyphs", &t.completePairedGlyphs);
     iniIO.setSetting("editor.middleMousePan", &t.middleMousePan);
+    iniIO.setSetting("editor.vimMode", &t.vimMode);
 
 #define EDITOR_COLOR(NAME)                                                                                             \
   iniIO.setSetting("editor.palette." #NAME, &m_editorSettings.textPalette[static_cast<size_t>(TextEditor::Color::NAME)]);
@@ -830,6 +831,14 @@ void Sample::guiPaneCode()
   ImGui::Spacing();
   {
     compile = ImGui::Button("Compile (F3)") || compile;
+    if(m_editors[+Editor::eCode].IsVimModeEnabled())
+    {
+      ImGui::SameLine();
+      ImGui::AlignTextToFramePadding();
+      ImGui::PushFont(nvgui::getMonospaceFont());
+      ImGui::TextDisabled("%s", m_editors[+Editor::eCode].GetVimStatusText().c_str());
+      ImGui::PopFont();
+    }
   }
 
   if(compile)
@@ -953,6 +962,7 @@ void Sample::guiPaneEditorSettings()
     PE::Checkbox("Show matching brackets", &t.showMatchingBrackets);
     PE::Checkbox("Complete paired glyphs", &t.completePairedGlyphs);
     PE::Checkbox("Middle mouse pans instead of scrolls", &t.middleMousePan);
+    PE::Checkbox("Vim mode", &t.vimMode, "Use modal Vim keybindings (Normal, Insert, Visual) in the Code editor.");
     updateTextEditorSettings();
 
     PE::treePop();
@@ -1897,6 +1907,7 @@ void Sample::updateTextEditorSettings()
       editor.SetMiddleMouseScrollMode();
     }
   }
+  m_editors[+Editor::eCode].SetVimModeEnabled(t.vimMode);
 }
 
 void Sample::updateTextEditorPalettes()

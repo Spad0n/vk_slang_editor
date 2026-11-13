@@ -167,6 +167,1919 @@ void TextEditorEx::ReplaceRange(int startLine, int startColumn, int endLine, int
   endTransaction(std::move(transaction));
 }
 
+void TextEditorEx::SetVimModeEnabled(bool enabled)
+{
+  if(m_vimEnabled == enabled)
+  {
+    return;
+  }
+  m_vimEnabled = enabled;
+  m_vimMode    = VimMode::eNormal;
+  overwrite    = false;
+  resetVimPendingState();
+  if(m_vimEnabled && !document.isEmpty())
+  {
+    cursors.clearAdditional(true);
+    Coordinate cur = clampVimNormalCoord(cursors.getCurrent().getInteractiveEnd());
+    cursors.setCursor(cur);
+  }
+}
+
+std::string TextEditorEx::GetVimStatusText() const
+{
+  if(!m_vimEnabled)
+  {
+    return "";
+  }
+  std::string status;
+  switch(m_vimMode)
+  {
+    case VimMode::eNormal:
+      status = "-- NORMAL --";
+      break;
+    case VimMode::eInsert:
+      status = "-- INSERT --";
+      break;
+    case VimMode::eReplace:
+      status = "-- REPLACE --";
+      break;
+    case VimMode::eVisual:
+      status = "-- VISUAL --";
+      break;
+    case VimMode::eVisualLine:
+      status = "-- VISUAL LINE --";
+      break;
+  }
+
+  std::string pending;
+  if(m_vimCount > 0)
+  {
+    pending += std::to_string(m_vimCount);
+  }
+  if(m_vimPendingOp != 0)
+  {
+    pending += m_vimPendingOp;
+  }
+  if(m_vimPendingSubOp != 0)
+  {
+    pending += m_vimPendingSubOp;
+  }
+  if(!pending.empty())
+  {
+    status += "  [" + pending + "]";
+  }
+  return status;
+}
+
+void TextEditorEx::resetVimPendingState()
+{
+  m_vimCount        = 0;
+  m_vimPendingOp    = 0;
+  m_vimPendingSubOp = 0;
+}
+
+TextEditor::Coordinate TextEditorEx::clampVimNormalCoord(Coordinate c) const
+{
+  c         = document.normalizeCoordinate(c);
+  auto& ln  = document[c.line];
+  if(ln.empty())
+  {
+    return Coordinate(c.line, 0);
+  }
+  size_t idx = document.getIndex(c);
+  if(idx >= ln.size())
+  {
+    idx = ln.size() - 1;
+  }
+  return Coordinate(c.line, document.getColumn(c.line, idx));
+}
+
+TextEditor::Coordinate TextEditorEx::getVimCharEndOnLine(Coordinate c) const
+{
+  c         = document.normalizeCoordinate(c);
+  auto& ln  = document[c.line];
+  if(ln.empty())
+  {
+    return Coordinate(c.line, 0);
+  }
+  size_t idx = document.getIndex(c);
+  if(idx < ln.size())
+  {
+    idx++;
+  }
+  return Coordinate(c.line, document.getColumn(c.line, idx));
+}
+
+TextEditor::Coordinate TextEditorEx::getVimFirstNonBlank(int line) const
+{
+  line = std::clamp(line, 0, document.lineCount() - 1);
+  const auto& ln = document[line];
+  size_t idx = 0;
+  while(idx < ln.size() && CodePoint::isWhiteSpace(ln[idx].codepoint))
+  {
+    idx++;
+  }
+  if(idx >= ln.size() && !ln.empty())
+  {
+    idx = ln.size() - 1;
+  }
+  return Coordinate(line, document.getColumn(line, idx));
+}
+
+static int getVimCharClass(ImWchar cp, bool bigWord)
+{
+  if(TextEditor::CodePoint::isWhiteSpace(cp))
+  {
+    return 0;
+  }
+  if(bigWord)
+  {
+    return 1;
+  }
+  return TextEditor::CodePoint::isWord(cp) ? 1 : 2;
+}
+
+TextEditor::Coordinate TextEditorEx::getVimWordForward(Coordinate from, bool bigWord) const
+{
+  from       = document.normalizeCoordinate(from);
+  int line   = from.line;
+  size_t idx = document.getIndex(from);
+
+  if(idx < document[line].size())
+  {
+    const int startClass = getVimCharClass(document[line][idx].codepoint, bigWord);
+    if(startClass != 0)
+    {
+      while(idx < document[line].size() && getVimCharClass(document[line][idx].codepoint, bigWord) == startClass)
+      {
+        idx++;
+      }
+    }
+  }
+
+  while(true)
+  {
+    while(idx < document[line].size() && CodePoint::isWhiteSpace(document[line][idx].codepoint))
+    {
+      idx++;
+    }
+    if(idx < document[line].size())
+    {
+      return Coordinate(line, document.getColumn(line, idx));
+    }
+    if(line + 1 >= document.lineCount())
+    {
+      return Coordinate(line, document[line].maxColumn);
+    }
+    line++;
+    idx = 0;
+    if(document[line].empty())
+    {
+      return Coordinate(line, 0);
+    }
+  }
+}
+
+TextEditor::Coordinate TextEditorEx::getVimWordBackward(Coordinate from, bool bigWord) const
+{
+  from       = document.normalizeCoordinate(from);
+  int line   = from.line;
+  size_t idx = document.getIndex(from);
+
+  // Step 1 character left (crossing lines if needed)
+  while(true)
+  {
+    if(idx > 0)
+    {
+      idx--;
+      break;
+    }
+    if(line == 0)
+    {
+      return Coordinate(0, 0);
+    }
+    line--;
+    idx = document[line].size();
+    if(idx == 0)
+    {
+      return Coordinate(line, 0);
+    }
+  }
+
+  // Skip whitespace backwards across lines
+  while(true)
+  {
+    while(idx > 0 && CodePoint::isWhiteSpace(document[line][idx].codepoint))
+    {
+      idx--;
+    }
+    if(!document[line].empty() && !CodePoint::isWhiteSpace(document[line][idx].codepoint))
+    {
+      break;
+    }
+    if(line == 0)
+    {
+      return Coordinate(0, 0);
+    }
+    line--;
+    if(document[line].empty())
+    {
+      return Coordinate(line, 0);
+    }
+    idx = document[line].size() - 1;
+  }
+
+  const int targetClass = getVimCharClass(document[line][idx].codepoint, bigWord);
+  while(idx > 0 && getVimCharClass(document[line][idx - 1].codepoint, bigWord) == targetClass)
+  {
+    idx--;
+  }
+  return Coordinate(line, document.getColumn(line, idx));
+}
+
+TextEditor::Coordinate TextEditorEx::getVimWordEnd(Coordinate from, bool bigWord) const
+{
+  from       = document.normalizeCoordinate(from);
+  int line   = from.line;
+  size_t idx = document.getIndex(from);
+
+  // Advance at least 1 character
+  if(idx + 1 < document[line].size())
+  {
+    idx++;
+  }
+  else
+  {
+    while(true)
+    {
+      if(line + 1 >= document.lineCount())
+      {
+        return clampVimNormalCoord(Coordinate(line, document[line].maxColumn));
+      }
+      line++;
+      idx = 0;
+      if(!document[line].empty())
+      {
+        break;
+      }
+    }
+  }
+
+  // Skip whitespace forward across lines
+  while(true)
+  {
+    while(idx < document[line].size() && CodePoint::isWhiteSpace(document[line][idx].codepoint))
+    {
+      idx++;
+    }
+    if(idx < document[line].size())
+    {
+      break;
+    }
+    if(line + 1 >= document.lineCount())
+    {
+      return clampVimNormalCoord(Coordinate(line, document[line].maxColumn));
+    }
+    line++;
+    idx = 0;
+  }
+
+  const int targetClass = getVimCharClass(document[line][idx].codepoint, bigWord);
+  while(idx + 1 < document[line].size() && getVimCharClass(document[line][idx + 1].codepoint, bigWord) == targetClass)
+  {
+    idx++;
+  }
+  return Coordinate(line, document.getColumn(line, idx));
+}
+
+TextEditor::Coordinate TextEditorEx::getVimMatchingBracket(Coordinate from) const
+{
+  from          = document.normalizeCoordinate(from);
+  const auto& l = document[from.line];
+  size_t idx    = document.getIndex(from);
+  if(l.empty())
+  {
+    return from;
+  }
+  if(idx >= l.size())
+  {
+    idx = l.size() - 1;
+  }
+
+  // Find a bracket on or after idx on the current line
+  ImWchar ch     = 0;
+  bool    opener = false;
+  while(idx < l.size())
+  {
+    const ImWchar cp = l[idx].codepoint;
+    if(CodePoint::isBracketOpener(cp))
+    {
+      ch     = cp;
+      opener = true;
+      break;
+    }
+    if(CodePoint::isBracketCloser(cp))
+    {
+      ch     = cp;
+      opener = false;
+      break;
+    }
+    idx++;
+  }
+  if(ch == 0)
+  {
+    return from;
+  }
+
+  const ImWchar matchCh = opener ? CodePoint::toPairCloser(ch) : CodePoint::toPairOpener(ch);
+  int           depth   = 1;
+  int           line    = from.line;
+
+  if(opener)
+  {
+    size_t i = idx + 1;
+    while(line < document.lineCount())
+    {
+      const auto& curLine = document[line];
+      while(i < curLine.size())
+      {
+        if(curLine[i].codepoint == ch)
+        {
+          depth++;
+        }
+        else if(curLine[i].codepoint == matchCh)
+        {
+          depth--;
+          if(depth == 0)
+          {
+            return Coordinate(line, document.getColumn(line, i));
+          }
+        }
+        i++;
+      }
+      line++;
+      i = 0;
+    }
+  }
+  else
+  {
+    size_t i = idx;
+    while(line >= 0)
+    {
+      const auto& curLine = document[line];
+      while(i > 0)
+      {
+        i--;
+        if(curLine[i].codepoint == ch)
+        {
+          depth++;
+        }
+        else if(curLine[i].codepoint == matchCh)
+        {
+          depth--;
+          if(depth == 0)
+          {
+            return Coordinate(line, document.getColumn(line, i));
+          }
+        }
+      }
+      line--;
+      if(line >= 0)
+      {
+        i = document[line].size();
+      }
+    }
+  }
+  return from;
+}
+
+void TextEditorEx::enterVimNormalMode(bool moveLeftOnExitInsert)
+{
+  const bool wasInsertOrReplace = (m_vimMode == VimMode::eInsert || m_vimMode == VimMode::eReplace);
+  m_vimMode                     = VimMode::eNormal;
+  overwrite                     = false;
+  resetVimPendingState();
+
+  cursors.clearAdditional(false);
+  Coordinate cur = cursors.getCurrent().getInteractiveEnd();
+  if(moveLeftOnExitInsert && wasInsertOrReplace)
+  {
+    size_t idx = document.getIndex(cur);
+    if(idx > 0)
+    {
+      cur = Coordinate(cur.line, document.getColumn(cur.line, idx - 1));
+    }
+  }
+  cur = clampVimNormalCoord(cur);
+  cursors.setCursor(cur);
+  makeCursorVisible();
+}
+
+void TextEditorEx::enterVimInsertMode()
+{
+  m_vimMode = VimMode::eInsert;
+  overwrite = false;
+  resetVimPendingState();
+  cursors.clearAdditional(false);
+  Coordinate cur = cursors.getCurrent().getInteractiveEnd();
+  cursors.setCursor(cur);
+  makeCursorVisible();
+}
+
+void TextEditorEx::updateVimVisualSelection()
+{
+  m_vimVisualAnchor = clampVimNormalCoord(m_vimVisualAnchor);
+  m_vimVisualHead   = clampVimNormalCoord(m_vimVisualHead);
+
+  if(m_vimMode == VimMode::eVisualLine)
+  {
+    const int firstLine = std::min(m_vimVisualAnchor.line, m_vimVisualHead.line);
+    const int lastLine  = std::max(m_vimVisualAnchor.line, m_vimVisualHead.line);
+    cursors.setCursor(Coordinate(firstLine, 0), Coordinate(lastLine, document[lastLine].maxColumn));
+  }
+  else if(m_vimMode == VimMode::eVisual)
+  {
+    if(m_vimVisualHead >= m_vimVisualAnchor)
+    {
+      cursors.setCursor(m_vimVisualAnchor, getVimCharEndOnLine(m_vimVisualHead));
+    }
+    else
+    {
+      cursors.setCursor(getVimCharEndOnLine(m_vimVisualAnchor), m_vimVisualHead);
+    }
+  }
+  makeCursorVisible();
+}
+
+void TextEditorEx::yankVimRange(Coordinate start, Coordinate end, bool linewise)
+{
+  if(end < start)
+  {
+    std::swap(start, end);
+  }
+  m_vimLastYankLine = linewise;
+  std::string text;
+  if(linewise)
+  {
+    const int firstLine = std::clamp(start.line, 0, document.lineCount() - 1);
+    const int lastLine  = std::clamp(end.line, firstLine, document.lineCount() - 1);
+    for(int l = firstLine; l <= lastLine; l++)
+    {
+      if(l > firstLine)
+      {
+        text += '\n';
+      }
+      text += document.getLineText(l);
+    }
+  }
+  else
+  {
+    text = document.getSectionText(start, end);
+  }
+  ImGui::SetClipboardText(text.c_str());
+}
+
+void TextEditorEx::deleteVimRange(Coordinate start, Coordinate end, bool linewise)
+{
+  if(readOnly)
+  {
+    return;
+  }
+  if(end < start)
+  {
+    std::swap(start, end);
+  }
+  yankVimRange(start, end, linewise);
+
+  auto transaction = startTransaction();
+  if(linewise)
+  {
+    const int firstLine = std::clamp(start.line, 0, document.lineCount() - 1);
+    const int lastLine  = std::clamp(end.line, firstLine, document.lineCount() - 1);
+
+    Coordinate delStart;
+    Coordinate delEnd;
+    int        targetLine = firstLine;
+
+    if(firstLine == 0 && lastLine == document.lineCount() - 1)
+    {
+      delStart   = Coordinate(0, 0);
+      delEnd     = Coordinate(lastLine, document[lastLine].maxColumn);
+      targetLine = 0;
+    }
+    else if(lastLine < document.lineCount() - 1)
+    {
+      delStart   = Coordinate(firstLine, 0);
+      delEnd     = Coordinate(lastLine + 1, 0);
+      targetLine = firstLine;
+    }
+    else
+    {
+      delStart   = Coordinate(firstLine - 1, document[firstLine - 1].maxColumn);
+      delEnd     = Coordinate(lastLine, document[lastLine].maxColumn);
+      targetLine = firstLine - 1;
+    }
+
+    deleteText(transaction, delStart, delEnd);
+    endTransaction(transaction);
+
+    Coordinate newCur = getVimFirstNonBlank(std::min(targetLine, document.lineCount() - 1));
+    cursors.setCursor(newCur);
+  }
+  else
+  {
+    deleteText(transaction, start, end);
+    endTransaction(transaction);
+    cursors.setCursor(clampVimNormalCoord(start));
+  }
+  makeCursorVisible();
+}
+
+void TextEditorEx::pasteVim(bool after)
+{
+  if(readOnly)
+  {
+    return;
+  }
+  const char* clipboard = ImGui::GetClipboardText();
+  if(!clipboard || clipboard[0] == '\0')
+  {
+    return;
+  }
+
+  std::string clipText(clipboard);
+  // Normalize CRLF
+  clipText.erase(std::remove(clipText.begin(), clipText.end(), '\r'), clipText.end());
+
+  if(m_vimMode == VimMode::eVisual || m_vimMode == VimMode::eVisualLine)
+  {
+    const bool linewise = (m_vimMode == VimMode::eVisualLine);
+    Coordinate start    = cursors.getCurrent().getSelectionStart();
+    Coordinate end      = cursors.getCurrent().getSelectionEnd();
+    if(linewise)
+    {
+      start = Coordinate( std::min(m_vimVisualAnchor.line, m_vimVisualHead.line), 0 );
+      end   = Coordinate( std::max(m_vimVisualAnchor.line, m_vimVisualHead.line),
+                          document[std::max(m_vimVisualAnchor.line, m_vimVisualHead.line)].maxColumn );
+    }
+    auto transaction = startTransaction();
+    deleteText(transaction, start, end);
+    Coordinate insEnd = insertText(transaction, start, clipText);
+    endTransaction(transaction);
+    m_vimMode = VimMode::eNormal;
+    resetVimPendingState();
+    cursors.setCursor(clampVimNormalCoord(insEnd));
+    makeCursorVisible();
+    return;
+  }
+
+  Coordinate cur         = clampVimNormalCoord(cursors.getCurrent().getInteractiveEnd());
+  auto       transaction = startTransaction();
+
+  if(m_vimLastYankLine)
+  {
+    // Strip trailing newline if present so we control exact line insertion
+    if(!clipText.empty() && clipText.back() == '\n')
+    {
+      clipText.pop_back();
+    }
+    if(after)
+    {
+      Coordinate insPos = Coordinate(cur.line, document[cur.line].maxColumn);
+      insertText(transaction, insPos, "\n" + clipText);
+      endTransaction(transaction);
+      cursors.setCursor(getVimFirstNonBlank(std::min(cur.line + 1, document.lineCount() - 1)));
+    }
+    else
+    {
+      Coordinate insPos = Coordinate(cur.line, 0);
+      insertText(transaction, insPos, clipText + "\n");
+      endTransaction(transaction);
+      cursors.setCursor(getVimFirstNonBlank(cur.line));
+    }
+  }
+  else
+  {
+    Coordinate insPos = after ? getVimCharEndOnLine(cur) : cur;
+    Coordinate insEnd = insertText(transaction, insPos, clipText);
+    endTransaction(transaction);
+    size_t idx = document.getIndex(insEnd);
+    if(idx > 0)
+    {
+      insEnd = Coordinate(insEnd.line, document.getColumn(insEnd.line, idx - 1));
+    }
+    cursors.setCursor(clampVimNormalCoord(insEnd));
+  }
+  makeCursorVisible();
+}
+
+bool TextEditorEx::resolveVimTextObject(char modifier, ImWchar obj, Coordinate cur, Coordinate& outStart, Coordinate& outEnd) const
+{
+  const bool around = (modifier == 'a');
+  cur               = clampVimNormalCoord(cur);
+  const auto& line  = document[cur.line];
+
+  if(obj == 'w' || obj == 'W')
+  {
+    if(line.empty())
+    {
+      outStart = Coordinate(cur.line, 0);
+      outEnd   = Coordinate(cur.line, 0);
+      return true;
+    }
+    const bool bigWord = (obj == 'W');
+    size_t     idx     = std::min(document.getIndex(cur), line.size() - 1);
+    const int  cls     = getVimCharClass(line[idx].codepoint, bigWord);
+    size_t     start   = idx;
+    size_t     end     = idx + 1;
+    while(start > 0 && getVimCharClass(line[start - 1].codepoint, bigWord) == cls)
+    {
+      start--;
+    }
+    while(end < line.size() && getVimCharClass(line[end].codepoint, bigWord) == cls)
+    {
+      end++;
+    }
+    if(around)
+    {
+      if(end < line.size() && CodePoint::isWhiteSpace(line[end].codepoint))
+      {
+        while(end < line.size() && CodePoint::isWhiteSpace(line[end].codepoint))
+        {
+          end++;
+        }
+      }
+      else
+      {
+        while(start > 0 && CodePoint::isWhiteSpace(line[start - 1].codepoint))
+        {
+          start--;
+        }
+      }
+    }
+    outStart = Coordinate(cur.line, document.getColumn(cur.line, start));
+    outEnd   = Coordinate(cur.line, document.getColumn(cur.line, end));
+    return true;
+  }
+
+  // Quoted strings on the current line: ", ', `
+  if(obj == '"' || obj == '\'' || obj == '`')
+  {
+    if(line.empty())
+    {
+      return false;
+    }
+    size_t curIdx = std::min(document.getIndex(cur), line.size() - 1);
+    std::vector<size_t> quotes;
+    for(size_t i = 0; i < line.size(); i++)
+    {
+      if(line[i].codepoint == obj && (i == 0 || line[i - 1].codepoint != '\\'))
+      {
+        quotes.push_back(i);
+      }
+    }
+    for(size_t k = 0; k + 1 < quotes.size(); k += 2)
+    {
+      const size_t q1 = quotes[k];
+      const size_t q2 = quotes[k + 1];
+      if(curIdx <= q2)
+      {
+        const size_t s = around ? q1 : (q1 + 1);
+        const size_t e = around ? (q2 + 1) : q2;
+        outStart       = Coordinate(cur.line, document.getColumn(cur.line, s));
+        outEnd         = Coordinate(cur.line, document.getColumn(cur.line, e));
+        return true;
+      }
+    }
+    return false;
+  }
+
+  // Paired brackets: (), {}, [], <>
+  ImWchar openCh  = 0;
+  ImWchar closeCh = 0;
+  if(obj == '(' || obj == ')' || obj == 'b')
+  {
+    openCh  = '(';
+    closeCh = ')';
+  }
+  else if(obj == '{' || obj == '}' || obj == 'B')
+  {
+    openCh  = '{';
+    closeCh = '}';
+  }
+  else if(obj == '[' || obj == ']')
+  {
+    openCh  = '[';
+    closeCh = ']';
+  }
+  else if(obj == '<' || obj == '>')
+  {
+    openCh  = '<';
+    closeCh = '>';
+  }
+
+  if(openCh != 0)
+  {
+    // Search backward for unmatched openCh (including under cursor if it's openCh)
+    int    sLine  = cur.line;
+    size_t sIdx   = document.getIndex(cur);
+    int    depth  = 0;
+    bool   foundS = false;
+
+    if(sIdx < document[sLine].size() && document[sLine][sIdx].codepoint == openCh)
+    {
+      foundS = true;
+    }
+    else
+    {
+      int    l = sLine;
+      size_t i = sIdx;
+      while(l >= 0 && !foundS)
+      {
+        const auto& ln = document[l];
+        while(i > 0)
+        {
+          i--;
+          if(ln[i].codepoint == closeCh)
+          {
+            depth++;
+          }
+          else if(ln[i].codepoint == openCh)
+          {
+            if(depth == 0)
+            {
+              sLine  = l;
+              sIdx   = i;
+              foundS = true;
+              break;
+            }
+            depth--;
+          }
+        }
+        l--;
+        if(l >= 0)
+        {
+          i = document[l].size();
+        }
+      }
+    }
+
+    if(!foundS)
+    {
+      return false;
+    }
+
+    // Search forward from (sLine, sIdx + 1) for matching closeCh
+    int    eLine  = sLine;
+    size_t eIdx   = sIdx + 1;
+    depth         = 1;
+    bool   foundE = false;
+    while(eLine < document.lineCount() && !foundE)
+    {
+      const auto& ln = document[eLine];
+      while(eIdx < ln.size())
+      {
+        if(ln[eIdx].codepoint == openCh)
+        {
+          depth++;
+        }
+        else if(ln[eIdx].codepoint == closeCh)
+        {
+          depth--;
+          if(depth == 0)
+          {
+            foundE = true;
+            break;
+          }
+        }
+        eIdx++;
+      }
+      if(!foundE)
+      {
+        eLine++;
+        eIdx = 0;
+      }
+    }
+
+    if(!foundE)
+    {
+      return false;
+    }
+
+    if(around)
+    {
+      outStart = Coordinate(sLine, document.getColumn(sLine, sIdx));
+      outEnd   = Coordinate(eLine, document.getColumn(eLine, eIdx + 1));
+    }
+    else
+    {
+      outStart = Coordinate(sLine, document.getColumn(sLine, sIdx + 1));
+      outEnd   = Coordinate(eLine, document.getColumn(eLine, eIdx));
+    }
+    return true;
+  }
+
+  return false;
+}
+
+bool TextEditorEx::resolveVimMotion(ImWchar motion, ImWchar arg, int count, Coordinate cur,
+                                    Coordinate& outTarget, bool& outLinewise, bool& outInclusive) const
+{
+  const int n  = std::max(1, count);
+  cur          = clampVimNormalCoord(cur);
+  outLinewise  = false;
+  outInclusive = false;
+  outTarget    = cur;
+
+  switch(motion)
+  {
+    case 'h':
+    {
+      size_t idx = document.getIndex(cur);
+      idx        = (idx > static_cast<size_t>(n)) ? (idx - n) : 0;
+      outTarget  = Coordinate(cur.line, document.getColumn(cur.line, idx));
+      return true;
+    }
+    case 'l':
+    case ' ':
+    {
+      const auto& ln = document[cur.line];
+      if(ln.empty())
+      {
+        outTarget = Coordinate(cur.line, 0);
+      }
+      else
+      {
+        size_t idx = std::min(document.getIndex(cur) + static_cast<size_t>(n), ln.size());
+        outTarget  = Coordinate(cur.line, document.getColumn(cur.line, idx));
+      }
+      return true;
+    }
+    case 'j':
+    {
+      const int targetLine = std::min(document.lineCount() - 1, cur.line + n);
+      outTarget            = clampVimNormalCoord(Coordinate(targetLine, cur.column));
+      outLinewise          = true;
+      return true;
+    }
+    case 'k':
+    {
+      const int targetLine = std::max(0, cur.line - n);
+      outTarget            = clampVimNormalCoord(Coordinate(targetLine, cur.column));
+      outLinewise          = true;
+      return true;
+    }
+    case '0':
+    {
+      outTarget = Coordinate(cur.line, 0);
+      return true;
+    }
+    case '^':
+    case '_':
+    {
+      outTarget = getVimFirstNonBlank(cur.line);
+      return true;
+    }
+    case '$':
+    {
+      outTarget    = Coordinate(cur.line, document[cur.line].maxColumn);
+      outInclusive = true;
+      return true;
+    }
+    case 'w':
+    case 'W':
+    {
+      Coordinate pos = cur;
+      for(int i = 0; i < n; i++)
+      {
+        pos = getVimWordForward(pos, motion == 'W');
+      }
+      outTarget = pos;
+      return true;
+    }
+    case 'b':
+    case 'B':
+    {
+      Coordinate pos = cur;
+      for(int i = 0; i < n; i++)
+      {
+        pos = getVimWordBackward(pos, motion == 'B');
+      }
+      outTarget = pos;
+      return true;
+    }
+    case 'e':
+    case 'E':
+    {
+      Coordinate pos = cur;
+      for(int i = 0; i < n; i++)
+      {
+        pos = getVimWordEnd(pos, motion == 'E');
+      }
+      outTarget    = pos;
+      outInclusive = true;
+      return true;
+    }
+    case 'G':
+    {
+      const int targetLine = (count > 0) ? std::clamp(count - 1, 0, document.lineCount() - 1) : (document.lineCount() - 1);
+      outTarget            = getVimFirstNonBlank(targetLine);
+      outLinewise          = true;
+      return true;
+    }
+    case '%':
+    {
+      Coordinate match = getVimMatchingBracket(cur);
+      if(match == cur)
+      {
+        return false;
+      }
+      outTarget    = match;
+      outInclusive = true;
+      return true;
+    }
+    case '{':
+    {
+      int line = cur.line;
+      for(int i = 0; i < n; i++)
+      {
+        while(line > 0 && document[line].empty())
+        {
+          line--;
+        }
+        while(line > 0 && !document[line].empty())
+        {
+          line--;
+        }
+      }
+      outTarget = Coordinate(line, 0);
+      return true;
+    }
+    case '}':
+    {
+      int line = cur.line;
+      for(int i = 0; i < n; i++)
+      {
+        while(line + 1 < document.lineCount() && document[line].empty())
+        {
+          line++;
+        }
+        while(line + 1 < document.lineCount() && !document[line].empty())
+        {
+          line++;
+        }
+      }
+      outTarget = Coordinate(line, 0);
+      return true;
+    }
+    case 'f':
+    case 't':
+    {
+      const auto& ln  = document[cur.line];
+      size_t      idx = document.getIndex(cur);
+      for(int i = 0; i < n; i++)
+      {
+        size_t search = idx + 1;
+        while(search < ln.size() && ln[search].codepoint != arg)
+        {
+          search++;
+        }
+        if(search >= ln.size())
+        {
+          return false;
+        }
+        idx = search;
+      }
+      if(motion == 't' && idx > 0)
+      {
+        idx--;
+      }
+      outTarget    = Coordinate(cur.line, document.getColumn(cur.line, idx));
+      outInclusive = true;
+      return true;
+    }
+    case 'F':
+    case 'T':
+    {
+      const auto& ln  = document[cur.line];
+      size_t      idx = document.getIndex(cur);
+      for(int i = 0; i < n; i++)
+      {
+        if(idx == 0)
+        {
+          return false;
+        }
+        size_t search = idx - 1;
+        while(true)
+        {
+          if(ln[search].codepoint == arg)
+          {
+            idx = search;
+            break;
+          }
+          if(search == 0)
+          {
+            return false;
+          }
+          search--;
+        }
+      }
+      if(motion == 'T' && idx + 1 < ln.size())
+      {
+        idx++;
+      }
+      outTarget = Coordinate(cur.line, document.getColumn(cur.line, idx));
+      return true;
+    }
+    default:
+      return false;
+  }
+}
+
+void TextEditorEx::applyVimOperatorToRange(char op, Coordinate start, Coordinate end, bool linewise)
+{
+  if(end < start)
+  {
+    std::swap(start, end);
+  }
+  switch(op)
+  {
+    case 'y':
+      yankVimRange(start, end, linewise);
+      cursors.setCursor(clampVimNormalCoord(start));
+      break;
+    case 'd':
+      deleteVimRange(start, end, linewise);
+      break;
+    case 'c':
+      if(!readOnly)
+      {
+        if(linewise)
+        {
+          yankVimRange(start, end, true);
+          const int firstLine = std::clamp(start.line, 0, document.lineCount() - 1);
+          const int lastLine  = std::clamp(end.line, firstLine, document.lineCount() - 1);
+          // Preserve indentation of firstLine
+          std::string indent;
+          for(const auto& glyph : document[firstLine])
+          {
+            if(CodePoint::isWhiteSpace(glyph.codepoint))
+            {
+              char utf8[4];
+              indent.append(utf8, CodePoint::write(utf8, glyph.codepoint));
+            }
+            else
+            {
+              break;
+            }
+          }
+          auto       transaction = startTransaction();
+          Coordinate delStart(firstLine, 0);
+          Coordinate delEnd(lastLine, document[lastLine].maxColumn);
+          deleteText(transaction, delStart, delEnd);
+          Coordinate insEnd = insertText(transaction, delStart, indent);
+          endTransaction(transaction);
+          cursors.setCursor(insEnd);
+        }
+        else
+        {
+          yankVimRange(start, end, false);
+          auto transaction = startTransaction();
+          deleteText(transaction, start, end);
+          endTransaction(transaction);
+          cursors.setCursor(start);
+        }
+        enterVimInsertMode();
+      }
+      break;
+    case '>':
+      if(!readOnly)
+      {
+        SelectLines(start.line, end.line);
+        indentLines();
+        cursors.setCursor(getVimFirstNonBlank(start.line));
+      }
+      break;
+    case '<':
+      if(!readOnly)
+      {
+        SelectLines(start.line, end.line);
+        deindentLines();
+        cursors.setCursor(getVimFirstNonBlank(start.line));
+      }
+      break;
+  }
+}
+
+void TextEditorEx::handleVimKeyInNormalOrVisual(ImWchar ch)
+{
+  const bool isVisual = (m_vimMode == VimMode::eVisual || m_vimMode == VimMode::eVisualLine);
+  Coordinate cur      = isVisual ? m_vimVisualHead : clampVimNormalCoord(cursors.getCurrent().getInteractiveEnd());
+
+  auto applyMoveOrOp = [&](Coordinate target, bool linewise, bool inclusive) {
+    if(m_vimPendingOp != 0)
+    {
+      const char op = m_vimPendingOp;
+      resetVimPendingState();
+      Coordinate s = cur;
+      Coordinate e = target;
+      if(e < s)
+      {
+        std::swap(s, e);
+        if(inclusive)
+        {
+          e = getVimCharEndOnLine(e);
+        }
+      }
+      else if(inclusive)
+      {
+        e = getVimCharEndOnLine(e);
+      }
+      applyVimOperatorToRange(op, s, e, linewise);
+    }
+    else if(isVisual)
+    {
+      m_vimVisualHead = clampVimNormalCoord(target);
+      updateVimVisualSelection();
+      resetVimPendingState();
+    }
+    else
+    {
+      resetVimPendingState();
+      cursors.setCursor(clampVimNormalCoord(target));
+      makeCursorVisible();
+    }
+  };
+
+  // 1. Handle pending character-argument commands: r<char>, f<char>, F<char>, t<char>, T<char>
+  if(m_vimPendingSubOp == 'f' || m_vimPendingSubOp == 'F' || m_vimPendingSubOp == 't' || m_vimPendingSubOp == 'T')
+  {
+    const char findCmd = m_vimPendingSubOp;
+    m_vimPendingSubOp  = 0;
+    Coordinate target;
+    bool       linewise  = false;
+    bool       inclusive = false;
+    if(resolveVimMotion(findCmd, ch, m_vimCount, cur, target, linewise, inclusive))
+    {
+      applyMoveOrOp(target, linewise, inclusive);
+    }
+    else
+    {
+      resetVimPendingState();
+    }
+    return;
+  }
+
+  if(m_vimPendingOp == 'r')
+  {
+    const int n = std::max(1, m_vimCount);
+    resetVimPendingState();
+    if(!readOnly && ch >= 32)
+    {
+      const auto& ln  = document[cur.line];
+      size_t      idx = document.getIndex(cur);
+      if(idx + n <= ln.size())
+      {
+        char        utf8[4];
+        size_t      len = CodePoint::write(utf8, ch);
+        std::string replacement;
+        for(int i = 0; i < n; i++)
+        {
+          replacement.append(utf8, len);
+        }
+        Coordinate endCoord(cur.line, document.getColumn(cur.line, idx + n));
+        auto       transaction = startTransaction();
+        deleteText(transaction, cur, endCoord);
+        insertText(transaction, cur, replacement);
+        endTransaction(transaction);
+        cursors.setCursor(Coordinate(cur.line, document.getColumn(cur.line, idx + n - 1)));
+        makeCursorVisible();
+      }
+    }
+    return;
+  }
+
+  // 2. Handle pending text object modifier ('i' or 'a' in operator-pending or Visual mode)
+  if(m_vimPendingSubOp == 'i' || m_vimPendingSubOp == 'a')
+  {
+    const char mod    = m_vimPendingSubOp;
+    m_vimPendingSubOp = 0;
+    Coordinate s, e;
+    if(resolveVimTextObject(mod, ch, cur, s, e))
+    {
+      if(m_vimPendingOp != 0)
+      {
+        const char op = m_vimPendingOp;
+        resetVimPendingState();
+        applyVimOperatorToRange(op, s, e, false);
+      }
+      else if(isVisual)
+      {
+        m_vimMode         = VimMode::eVisual;
+        m_vimVisualAnchor = s;
+        size_t endIdx     = document.getIndex(e);
+        if(endIdx > 0)
+        {
+          e = Coordinate(e.line, document.getColumn(e.line, endIdx - 1));
+        }
+        m_vimVisualHead = e;
+        updateVimVisualSelection();
+        resetVimPendingState();
+      }
+    }
+    else
+    {
+      resetVimPendingState();
+    }
+    return;
+  }
+
+  // 3. Handle 'g' prefix commands: gg, ge, gu, gU, gc / gcc
+  if(m_vimPendingSubOp == 'g')
+  {
+    m_vimPendingSubOp = 0;
+    if(ch == 'g')
+    {
+      const int targetLine = (m_vimCount > 0) ? std::clamp(m_vimCount - 1, 0, document.lineCount() - 1) : 0;
+      applyMoveOrOp(getVimFirstNonBlank(targetLine), true, false);
+      return;
+    }
+    if(ch == 'c')
+    {
+      if(isVisual)
+      {
+        toggleComments();
+        enterVimNormalMode(false);
+      }
+      else
+      {
+        m_vimPendingOp = 'g'; // Wait for second 'c' in gcc
+      }
+      return;
+    }
+    resetVimPendingState();
+    return;
+  }
+
+  if(m_vimPendingOp == 'g')
+  {
+    resetVimPendingState();
+    if(ch == 'c' && !readOnly && language)
+    {
+      cursors.setCursor(cur);
+      toggleComments();
+    }
+    return;
+  }
+
+  // 4. Count prefix [1-9] or [0-9] when count > 0
+  if((ch >= '1' && ch <= '9') || (ch == '0' && m_vimCount > 0))
+  {
+    m_vimCount = std::min(100000, m_vimCount * 10 + static_cast<int>(ch - '0'));
+    return;
+  }
+
+  // 5. Double-operator linewise commands: dd, cc, yy, >>, <<
+  if(m_vimPendingOp != 0 && ch == static_cast<ImWchar>(m_vimPendingOp))
+  {
+    const char op       = m_vimPendingOp;
+    const int  n        = std::max(1, m_vimCount);
+    const int  lastLine = std::min(document.lineCount() - 1, cur.line + n - 1);
+    resetVimPendingState();
+    applyVimOperatorToRange(op, Coordinate(cur.line, 0), Coordinate(lastLine, document[lastLine].maxColumn), true);
+    return;
+  }
+
+  // 6. Text object start ('i' or 'a') when in operator-pending or Visual mode
+  if((m_vimPendingOp != 0 || isVisual) && (ch == 'i' || ch == 'a'))
+  {
+    m_vimPendingSubOp = static_cast<char>(ch);
+    return;
+  }
+
+  // 7. Find/till character triggers: f, F, t, T
+  if(ch == 'f' || ch == 'F' || ch == 't' || ch == 'T')
+  {
+    m_vimPendingSubOp = static_cast<char>(ch);
+    return;
+  }
+
+  // 8. 'g' prefix trigger
+  if(ch == 'g')
+  {
+    m_vimPendingSubOp = 'g';
+    return;
+  }
+
+  // 9. Motions (in Normal, Visual, or Operator-Pending mode)
+  {
+    Coordinate target;
+    bool       linewise  = false;
+    bool       inclusive = false;
+    if(resolveVimMotion(ch, 0, m_vimCount, cur, target, linewise, inclusive))
+    {
+      applyMoveOrOp(target, linewise, inclusive);
+      return;
+    }
+  }
+
+  // If an operator was pending and the key wasn't a valid motion/object, cancel
+  if(m_vimPendingOp != 0)
+  {
+    resetVimPendingState();
+    return;
+  }
+
+  const int n = std::max(1, m_vimCount);
+
+  // 10. Visual / VisualLine mode operations
+  if(isVisual)
+  {
+    Coordinate selStart = cursors.getCurrent().getSelectionStart();
+    Coordinate selEnd   = cursors.getCurrent().getSelectionEnd();
+    const bool linewise = (m_vimMode == VimMode::eVisualLine);
+
+    switch(ch)
+    {
+      case 'v':
+        if(m_vimMode == VimMode::eVisual)
+        {
+          enterVimNormalMode(false);
+        }
+        else
+        {
+          m_vimMode = VimMode::eVisual;
+          updateVimVisualSelection();
+        }
+        break;
+      case 'V':
+        if(m_vimMode == VimMode::eVisualLine)
+        {
+          enterVimNormalMode(false);
+        }
+        else
+        {
+          m_vimMode = VimMode::eVisualLine;
+          updateVimVisualSelection();
+        }
+        break;
+      case 'o':
+        std::swap(m_vimVisualAnchor, m_vimVisualHead);
+        updateVimVisualSelection();
+        break;
+      case 'd':
+      case 'x':
+        enterVimNormalMode(false);
+        applyVimOperatorToRange('d', selStart, selEnd, linewise);
+        break;
+      case 'c':
+      case 's':
+        m_vimMode = VimMode::eNormal;
+        applyVimOperatorToRange('c', selStart, selEnd, linewise);
+        break;
+      case 'y':
+        enterVimNormalMode(false);
+        applyVimOperatorToRange('y', selStart, selEnd, linewise);
+        break;
+      case 'p':
+      case 'P':
+        pasteVim(ch == 'p');
+        break;
+      case '>':
+        indentLines();
+        enterVimNormalMode(false);
+        break;
+      case '<':
+        deindentLines();
+        enterVimNormalMode(false);
+        break;
+      case 'u':
+        selectionToLowerCase();
+        enterVimNormalMode(false);
+        break;
+      case 'U':
+        selectionToUpperCase();
+        enterVimNormalMode(false);
+        break;
+      case '~':
+        FilterSelections([](std::string_view text) {
+          std::string res;
+          auto        it  = text.begin();
+          auto        end = text.end();
+          char        utf8[4];
+          while(it < end)
+          {
+            ImWchar cp;
+            it = CodePoint::read(it, end, &cp);
+            cp = CodePoint::isLower(cp) ? CodePoint::toUpper(cp) : CodePoint::toLower(cp);
+            res.append(utf8, CodePoint::write(utf8, cp));
+          }
+          return res;
+        });
+        enterVimNormalMode(false);
+        break;
+      default:
+        break;
+    }
+    resetVimPendingState();
+    return;
+  }
+
+  // 11. Normal mode actions
+  resetVimPendingState();
+  switch(ch)
+  {
+    case 'i':
+      cursors.setCursor(cur);
+      enterVimInsertMode();
+      break;
+    case 'I':
+      cursors.setCursor(getVimFirstNonBlank(cur.line));
+      enterVimInsertMode();
+      break;
+    case 'a':
+      cursors.setCursor(getVimCharEndOnLine(cur));
+      enterVimInsertMode();
+      break;
+    case 'A':
+      cursors.setCursor(Coordinate(cur.line, document[cur.line].maxColumn));
+      enterVimInsertMode();
+      break;
+    case 'o':
+      if(!readOnly)
+      {
+        cursors.setCursor(Coordinate(cur.line, document[cur.line].maxColumn));
+        handleCharacter('\n');
+        enterVimInsertMode();
+      }
+      break;
+    case 'O':
+      if(!readOnly)
+      {
+        std::string indent;
+        if(autoIndent)
+        {
+          for(const auto& glyph : document[cur.line])
+          {
+            if(CodePoint::isWhiteSpace(glyph.codepoint))
+            {
+              char utf8[4];
+              indent.append(utf8, CodePoint::write(utf8, glyph.codepoint));
+            }
+            else
+            {
+              break;
+            }
+          }
+        }
+        auto       transaction = startTransaction();
+        Coordinate lineStart(cur.line, 0);
+        insertText(transaction, lineStart, indent + "\n");
+        endTransaction(transaction);
+        cursors.setCursor(Coordinate(cur.line, document.getColumn(cur.line, indent.size())));
+        enterVimInsertMode();
+      }
+      break;
+    case 'R':
+      if(!readOnly)
+      {
+        m_vimMode = VimMode::eReplace;
+        overwrite = true;
+        cursors.setCursor(cur);
+      }
+      break;
+    case 'v':
+      m_vimMode         = VimMode::eVisual;
+      m_vimVisualAnchor = cur;
+      m_vimVisualHead   = cur;
+      updateVimVisualSelection();
+      break;
+    case 'V':
+      m_vimMode         = VimMode::eVisualLine;
+      m_vimVisualAnchor = cur;
+      m_vimVisualHead   = cur;
+      updateVimVisualSelection();
+      break;
+    case 'd':
+    case 'c':
+    case 'y':
+    case '>':
+    case '<':
+    case 'r':
+      m_vimPendingOp = static_cast<char>(ch);
+      m_vimCount     = n;
+      break;
+    case 'D':
+      applyVimOperatorToRange('d', cur, Coordinate(cur.line, document[cur.line].maxColumn), false);
+      break;
+    case 'C':
+      applyVimOperatorToRange('c', cur, Coordinate(cur.line, document[cur.line].maxColumn), false);
+      break;
+    case 'Y':
+    {
+      const int lastLine = std::min(document.lineCount() - 1, cur.line + n - 1);
+      applyVimOperatorToRange('y', Coordinate(cur.line, 0), Coordinate(lastLine, document[lastLine].maxColumn), true);
+      break;
+    }
+    case 's':
+      if(!readOnly)
+      {
+        const auto& ln  = document[cur.line];
+        size_t      idx = std::min(document.getIndex(cur) + static_cast<size_t>(n), ln.size());
+        Coordinate  end(cur.line, document.getColumn(cur.line, idx));
+        applyVimOperatorToRange('c', cur, end, false);
+      }
+      break;
+    case 'S':
+      applyVimOperatorToRange('c', Coordinate(cur.line, 0), Coordinate(cur.line, document[cur.line].maxColumn), true);
+      break;
+    case 'x':
+      if(!readOnly && !document[cur.line].empty())
+      {
+        const auto& ln  = document[cur.line];
+        size_t      idx = std::min(document.getIndex(cur) + static_cast<size_t>(n), ln.size());
+        Coordinate  end(cur.line, document.getColumn(cur.line, idx));
+        deleteVimRange(cur, end, false);
+      }
+      break;
+    case 'X':
+      if(!readOnly && !document[cur.line].empty())
+      {
+        size_t idx = document.getIndex(cur);
+        if(idx > 0)
+        {
+          size_t     startIdx = (idx > static_cast<size_t>(n)) ? (idx - n) : 0;
+          Coordinate start(cur.line, document.getColumn(cur.line, startIdx));
+          deleteVimRange(start, cur, false);
+        }
+      }
+      break;
+    case 'p':
+    case 'P':
+      for(int i = 0; i < n; i++)
+      {
+        pasteVim(ch == 'p');
+      }
+      break;
+    case 'u':
+      for(int i = 0; i < n; i++)
+      {
+        undo();
+      }
+      cursors.setCursor(clampVimNormalCoord(cursors.getCurrent().getInteractiveEnd()));
+      break;
+    case 'J':
+      if(!readOnly && cur.line + 1 < document.lineCount())
+      {
+        auto       transaction = startTransaction();
+        Coordinate endOfCur(cur.line, document[cur.line].maxColumn);
+        Coordinate firstOfNext = getVimFirstNonBlank(cur.line + 1);
+        if(document[cur.line + 1].empty())
+        {
+          firstOfNext = Coordinate(cur.line + 1, 0);
+        }
+        deleteText(transaction, endOfCur, firstOfNext);
+        if(!document[cur.line].empty())
+        {
+          insertText(transaction, endOfCur, " ");
+        }
+        endTransaction(transaction);
+        cursors.setCursor(clampVimNormalCoord(endOfCur));
+      }
+      break;
+    case '~':
+      if(!readOnly && !document[cur.line].empty())
+      {
+        size_t idx = document.getIndex(cur);
+        if(idx < document[cur.line].size())
+        {
+          ImWchar cp = document[cur.line][idx].codepoint;
+          cp         = CodePoint::isLower(cp) ? CodePoint::toUpper(cp) : CodePoint::toLower(cp);
+          char   utf8[4];
+          size_t len = CodePoint::write(utf8, cp);
+          Coordinate nextCoord = getVimCharEndOnLine(cur);
+          auto       transaction = startTransaction();
+          deleteText(transaction, cur, nextCoord);
+          insertText(transaction, cur, std::string_view(utf8, len));
+          endTransaction(transaction);
+          cursors.setCursor(clampVimNormalCoord(nextCoord));
+        }
+      }
+      break;
+    case '/':
+      openFindReplace();
+      break;
+    case 'n':
+      findNext();
+      cursors.setCursor(clampVimNormalCoord(cursors.getCurrent().getSelectionStart()));
+      break;
+    case 'N':
+      if(!findText.empty())
+      {
+        // Search backward by finding the last match before current cursor
+        Coordinate curStart = cursors.getCurrent().getSelectionStart();
+        Coordinate bestStart = Coordinate::invalid();
+        Coordinate bestEnd   = Coordinate::invalid();
+        Coordinate searchFrom(0, 0);
+        Coordinate s, e;
+        while(document.findText(searchFrom, findText, caseSensitiveFind, wholeWordFind, s, e))
+        {
+          if(s < curStart)
+          {
+            bestStart = s;
+            bestEnd   = e;
+            if(e <= searchFrom)
+            {
+              break;
+            }
+            searchFrom = e;
+          }
+          else
+          {
+            break;
+          }
+        }
+        if(!bestStart.isValid())
+        {
+          // Wrap around to the last match in the document
+          searchFrom = curStart;
+          while(document.findText(searchFrom, findText, caseSensitiveFind, wholeWordFind, s, e))
+          {
+            if(s >= searchFrom && (!bestStart.isValid() || s > bestStart))
+            {
+              bestStart  = s;
+              bestEnd    = e;
+              searchFrom = e;
+            }
+            else
+            {
+              break;
+            }
+          }
+        }
+        if(bestStart.isValid())
+        {
+          cursors.setCursor(bestStart);
+          makeCursorVisible();
+        }
+      }
+      break;
+    case '*':
+    {
+      Coordinate s, e;
+      if(resolveVimTextObject('i', 'w', cur, s, e) && s < e)
+      {
+        findText = document.getSectionText(s, e);
+        findNext();
+        cursors.setCursor(clampVimNormalCoord(cursors.getCurrent().getSelectionStart()));
+      }
+      break;
+    }
+    default:
+      break;
+  }
+}
+
+void TextEditorEx::handleKeyboardInputs()
+{
+  if(!m_vimEnabled)
+  {
+    TextEditor::handleKeyboardInputs();
+    return;
+  }
+
+  if(!ImGui::IsWindowFocused())
+  {
+    return;
+  }
+
+  // Take ownership of Escape while the editor child window is focused so
+  // Dear ImGui's NavUpdateCancelRequest() in NewFrame() does not use Escape
+  // to exit the child window and unfocus the editor before we can handle it.
+  ImGui::SetKeyOwner(ImGuiKey_Escape, ImGui::GetCurrentWindow()->ID);
+
+  ImGuiIO&   io    = ImGui::GetIO();
+  const bool shift = ImGui::IsKeyDown(ImGuiMod_Shift);
+  const bool ctrl  = ImGui::IsKeyDown(ImGuiMod_Ctrl);
+  const bool alt   = ImGui::IsKeyDown(ImGuiMod_Alt);
+
+  const bool escapePressed =
+      ImGui::IsKeyPressed(ImGuiKey_Escape, ImGuiInputFlags_None, ImGuiKeyOwner_Any)
+      || (ctrl && !shift && !alt && ImGui::IsKeyPressed(ImGuiKey_LeftBracket));
+
+  // In Insert or Replace mode, Escape returns to Normal mode; all other keys use standard TextEditor logic
+  if(m_vimMode == VimMode::eInsert || m_vimMode == VimMode::eReplace)
+  {
+    if(escapePressed)
+    {
+      io.InputQueueCharacters.resize(0);
+      enterVimNormalMode(true);
+      return;
+    }
+    if(ctrl && !alt)
+    {
+      io.InputQueueCharacters.resize(0);
+    }
+    TextEditor::handleKeyboardInputs();
+    return;
+  }
+
+  // Normal, Visual, or VisualLine mode
+  io.WantCaptureKeyboard = true;
+  io.WantTextInput       = true;
+
+  if(escapePressed)
+  {
+    io.InputQueueCharacters.resize(0);
+    enterVimNormalMode(false);
+    return;
+  }
+
+  // Shortcuts with Ctrl
+  if(ctrl && !alt)
+  {
+    if(!shift && ImGui::IsKeyPressed(ImGuiKey_R))
+    {
+      redo();
+      cursors.setCursor(clampVimNormalCoord(cursors.getCurrent().getInteractiveEnd()));
+    }
+    else if(!shift && ImGui::IsKeyPressed(ImGuiKey_U))
+    {
+      const int halfPage = std::max(1, visibleLines / 2);
+      handleVimKeyInNormalOrVisual(0); // keep state clean
+      Coordinate cur    = (m_vimMode == VimMode::eVisual || m_vimMode == VimMode::eVisualLine)
+                              ? m_vimVisualHead
+                              : cursors.getCurrent().getInteractiveEnd();
+      Coordinate target = clampVimNormalCoord(Coordinate(std::max(0, cur.line - halfPage), cur.column));
+      if(m_vimMode == VimMode::eVisual || m_vimMode == VimMode::eVisualLine)
+      {
+        m_vimVisualHead = target;
+        updateVimVisualSelection();
+      }
+      else
+      {
+        cursors.setCursor(target);
+        makeCursorVisible();
+      }
+    }
+    else if(!shift && ImGui::IsKeyPressed(ImGuiKey_D))
+    {
+      const int halfPage = std::max(1, visibleLines / 2);
+      Coordinate cur     = (m_vimMode == VimMode::eVisual || m_vimMode == VimMode::eVisualLine)
+                               ? m_vimVisualHead
+                               : cursors.getCurrent().getInteractiveEnd();
+      Coordinate target  = clampVimNormalCoord(Coordinate(std::min(document.lineCount() - 1, cur.line + halfPage), cur.column));
+      if(m_vimMode == VimMode::eVisual || m_vimMode == VimMode::eVisualLine)
+      {
+        m_vimVisualHead = target;
+        updateVimVisualSelection();
+      }
+      else
+      {
+        cursors.setCursor(target);
+        makeCursorVisible();
+      }
+    }
+    else if(!shift && ImGui::IsKeyPressed(ImGuiKey_F))
+    {
+      openFindReplace();
+    }
+    else if(!shift && ImGui::IsKeyPressed(ImGuiKey_C))
+    {
+      copy();
+    }
+    else if(!shift && !readOnly && ImGui::IsKeyPressed(ImGuiKey_V))
+    {
+      paste();
+    }
+    else if(!shift && !readOnly && ImGui::IsKeyPressed(ImGuiKey_Z))
+    {
+      undo();
+    }
+    else if(!readOnly && ((shift && ImGui::IsKeyPressed(ImGuiKey_Z)) || (!shift && ImGui::IsKeyPressed(ImGuiKey_Y))))
+    {
+      redo();
+    }
+    io.InputQueueCharacters.resize(0);
+    return;
+  }
+
+  // Non-printable navigation keys in Normal/Visual mode
+  if(!ctrl && !alt)
+  {
+    if(ImGui::IsKeyPressed(ImGuiKey_UpArrow))
+    {
+      handleVimKeyInNormalOrVisual('k');
+    }
+    else if(ImGui::IsKeyPressed(ImGuiKey_DownArrow))
+    {
+      handleVimKeyInNormalOrVisual('j');
+    }
+    else if(ImGui::IsKeyPressed(ImGuiKey_LeftArrow) || ImGui::IsKeyPressed(ImGuiKey_Backspace))
+    {
+      handleVimKeyInNormalOrVisual('h');
+    }
+    else if(ImGui::IsKeyPressed(ImGuiKey_RightArrow))
+    {
+      handleVimKeyInNormalOrVisual('l');
+    }
+    else if(ImGui::IsKeyPressed(ImGuiKey_Home))
+    {
+      handleVimKeyInNormalOrVisual('0');
+    }
+    else if(ImGui::IsKeyPressed(ImGuiKey_End))
+    {
+      handleVimKeyInNormalOrVisual('$');
+    }
+    else if(ImGui::IsKeyPressed(ImGuiKey_Delete))
+    {
+      handleVimKeyInNormalOrVisual('x');
+    }
+    else if(ImGui::IsKeyPressed(ImGuiKey_PageUp))
+    {
+      moveUp( std::max(1, visibleLines - 2), m_vimMode != VimMode::eNormal );
+    }
+    else if(ImGui::IsKeyPressed(ImGuiKey_PageDown))
+    {
+      moveDown( std::max(1, visibleLines - 2), m_vimMode != VimMode::eNormal );
+    }
+    else if(ImGui::IsKeyPressed(ImGuiKey_Enter) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter))
+    {
+      handleVimKeyInNormalOrVisual('j');
+      handleVimKeyInNormalOrVisual('^');
+    }
+  }
+
+  // Process layout-translated printable characters for Vim commands
+  if(!ctrl && !alt && !io.InputQueueCharacters.empty())
+  {
+    for(int i = 0; i < io.InputQueueCharacters.size(); i++)
+    {
+      const ImWchar ch = io.InputQueueCharacters[i];
+      if(ch >= 32)
+      {
+        handleVimKeyInNormalOrVisual(ch);
+        if(m_vimMode == VimMode::eInsert || m_vimMode == VimMode::eReplace)
+        {
+          // Remaining characters in this frame (if any) belong to Insert mode
+          for(int j = i + 1; j < io.InputQueueCharacters.size(); j++)
+          {
+            if(io.InputQueueCharacters[j] == '\n' || io.InputQueueCharacters[j] >= 32)
+            {
+              handleCharacter(io.InputQueueCharacters[j]);
+            }
+          }
+          break;
+        }
+      }
+    }
+    io.InputQueueCharacters.resize(0);
+  }
+}
+
+void TextEditorEx::renderCursors()
+{
+  if(!m_vimEnabled || m_vimMode == VimMode::eInsert)
+  {
+    TextEditor::renderCursors();
+    return;
+  }
+
+  // Draw block cursor (Normal / Visual / VisualLine) or thick underline (Replace)
+  cursorAnimationTimer = std::fmod(cursorAnimationTimer + ImGui::GetIO().DeltaTime, 1.0f);
+  if(ImGui::IsWindowFocused())
+  {
+    ImVec2      cursorScreenPos = ImGui::GetCursorScreenPos();
+    ImDrawList* drawList        = ImGui::GetWindowDrawList();
+
+    Coordinate pos = (m_vimMode == VimMode::eVisual || m_vimMode == VimMode::eVisualLine)
+                         ? m_vimVisualHead
+                         : cursors.getCurrent().getInteractiveEnd();
+    pos            = clampVimNormalCoord(pos);
+
+    if(pos.line >= firstVisibleLine && pos.line <= lastVisibleLine)
+    {
+      const float x = cursorScreenPos.x + textOffset + pos.column * glyphSize.x;
+      const float y = cursorScreenPos.y + pos.line * glyphSize.y;
+
+      ImVec4 cursorCol = ImGui::ColorConvertU32ToFloat4(palette.get(Color::cursor));
+      if(m_vimMode == VimMode::eReplace)
+      {
+        cursorCol.w *= 0.85f;
+        const float h = std::max(2.0f, glyphSize.y * 0.2f);
+        drawList->AddRectFilled(ImVec2(x, y + glyphSize.y - h), ImVec2(x + glyphSize.x, y + glyphSize.y),
+                                ImGui::ColorConvertFloat4ToU32(cursorCol));
+      }
+      else
+      {
+        cursorCol.w *= 0.55f;
+        drawList->AddRectFilled(ImVec2(x, y), ImVec2(x + glyphSize.x, y + glyphSize.y),
+                                ImGui::ColorConvertFloat4ToU32(cursorCol));
+      }
+    }
+  }
+}
+
 //-----------------------------------------------------------------------------
 // LANGUAGE SERVER
 
@@ -2065,12 +3978,22 @@ void LanguageServer::Implementation::interceptKeys()
         ImGui::SetKeyOwner(key, myId, ImGuiInputFlags_LockThisFrame);
       }
 
-      if(ImGui::IsKeyPressed(ImGuiKey_UpArrow, ImGuiInputFlags_Repeat, myId))
+      const bool ctrlOnly =
+          ImGui::IsKeyDown(ImGuiMod_Ctrl) && !ImGui::IsKeyDown(ImGuiMod_Shift) && !ImGui::IsKeyDown(ImGuiMod_Alt);
+      if(ctrlOnly)
+      {
+        ImGui::SetKeyOwner(ImGuiKey_J, myId, ImGuiInputFlags_LockThisFrame);
+        ImGui::SetKeyOwner(ImGuiKey_K, myId, ImGuiInputFlags_LockThisFrame);
+      }
+
+      if(ImGui::IsKeyPressed(ImGuiKey_UpArrow, ImGuiInputFlags_Repeat, myId)
+         || (ctrlOnly && ImGui::IsKeyPressed(ImGuiKey_K, ImGuiInputFlags_Repeat, myId)))
       {
         m_uiState.completionActive->index--;
       }
 
-      if(ImGui::IsKeyPressed(ImGuiKey_DownArrow, ImGuiInputFlags_Repeat, myId))
+      if(ImGui::IsKeyPressed(ImGuiKey_DownArrow, ImGuiInputFlags_Repeat, myId)
+         || (ctrlOnly && ImGui::IsKeyPressed(ImGuiKey_J, ImGuiInputFlags_Repeat, myId)))
       {
         m_uiState.completionActive->index++;
       }
@@ -2114,8 +4037,15 @@ void LanguageServer::Implementation::interceptKeys()
     }
 
     // Copy the input characters before TextEditor gets to them so we can
-    // react to new characters below
-    m_uiState.inputQueueCharacters = ImGui::GetIO().InputQueueCharacters;
+    // react to new characters below (only when in standard or Vim Insert/Replace mode)
+    if(!m_editor || m_editor->IsVimInsertOrReplaceMode())
+    {
+      m_uiState.inputQueueCharacters = ImGui::GetIO().InputQueueCharacters;
+    }
+    else
+    {
+      m_uiState.inputQueueCharacters.clear();
+    }
   }
 }
 
@@ -2271,7 +4201,14 @@ void LanguageServer::Implementation::doUI(bool codeEditorFocused)
   // Some keys also deactivate these; I'm not sure what the specification for this is.
   if(codeEditorFocused)
   {
-    if(!ImGui::IsKeyDown(ImGuiMod_Ctrl) && !ImGui::IsKeyDown(ImGuiMod_Alt))
+    if(m_editor && !m_editor->IsVimInsertOrReplaceMode())
+    {
+      m_uiState.completionActive = {};
+      m_uiState.signatureActive  = {};
+      m_uiState.completions.clear();
+      m_uiState.signatures.clear();
+    }
+    else if(!ImGui::IsKeyDown(ImGuiMod_Ctrl) && !ImGui::IsKeyDown(ImGuiMod_Alt))
     {
       const bool wasSignatureActive   = m_uiState.signatureActive.has_value();
       const bool wasCompletionActive  = m_uiState.completionActive.has_value();

@@ -33,6 +33,15 @@ const TextEditor::Language* getSpirVLanguageInfo();
 class TextEditorEx : public TextEditor
 {
 public:
+  enum class VimMode
+  {
+    eNormal,
+    eInsert,
+    eReplace,
+    eVisual,
+    eVisualLine
+  };
+
   void Render(const char* title, const ImVec2& size = ImVec2(), bool border = false);
 
   // Gets the screen position of the top-left corner of the glyph at the given
@@ -44,8 +53,47 @@ public:
   // ending at a given line and column with the given text.
   void ReplaceRange(int startLine, int startColumn, int endLine, int endColumn, const std::string_view& text);
 
+  // Vim modal editing support
+  void        SetVimModeEnabled(bool enabled);
+  bool        IsVimModeEnabled() const { return m_vimEnabled; }
+  VimMode     GetVimMode() const { return m_vimMode; }
+  bool        IsVimInsertOrReplaceMode() const { return !m_vimEnabled || m_vimMode == VimMode::eInsert || m_vimMode == VimMode::eReplace; }
+  std::string GetVimStatusText() const;
+
+protected:
+  void handleKeyboardInputs() override;
+  void renderCursors() override;
+
 private:
-  ImVec2 m_screenPosOnRender{};
+  ImVec2     m_screenPosOnRender{};
+  bool       m_vimEnabled      = false;
+  VimMode    m_vimMode         = VimMode::eNormal;
+  int        m_vimCount        = 0;
+  char       m_vimPendingOp    = 0;
+  char       m_vimPendingSubOp = 0;
+  bool       m_vimLastYankLine = false;
+  Coordinate m_vimVisualAnchor{0, 0};
+  Coordinate m_vimVisualHead{0, 0};
+
+  void       resetVimPendingState();
+  void       enterVimNormalMode(bool moveLeftOnExitInsert = false);
+  void       enterVimInsertMode();
+  Coordinate clampVimNormalCoord(Coordinate c) const;
+  Coordinate getVimCharEndOnLine(Coordinate c) const;
+  Coordinate getVimFirstNonBlank(int line) const;
+  Coordinate getVimWordForward(Coordinate from, bool bigWord = false) const;
+  Coordinate getVimWordBackward(Coordinate from, bool bigWord = false) const;
+  Coordinate getVimWordEnd(Coordinate from, bool bigWord = false) const;
+  Coordinate getVimMatchingBracket(Coordinate from) const;
+  void       updateVimVisualSelection();
+  void       yankVimRange(Coordinate start, Coordinate end, bool linewise);
+  void       deleteVimRange(Coordinate start, Coordinate end, bool linewise);
+  void       pasteVim(bool after);
+  bool       resolveVimTextObject(char modifier, ImWchar obj, Coordinate cur, Coordinate& outStart, Coordinate& outEnd) const;
+  bool       resolveVimMotion(ImWchar motion, ImWchar arg, int count, Coordinate cur,
+                              Coordinate& outTarget, bool& outLinewise, bool& outInclusive) const;
+  void       applyVimOperatorToRange(char op, Coordinate start, Coordinate end, bool linewise);
+  void       handleVimKeyInNormalOrVisual(ImWchar ch);
 };
 
 struct LanguageServer

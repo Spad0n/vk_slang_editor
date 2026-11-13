@@ -202,6 +202,7 @@ private:  // Member variables
       bool  showMatchingBrackets = true;
       bool  completePairedGlyphs = false;
       bool  middleMousePan       = false;
+      bool  vimMode              = false;
     } text;
     TextEditor::Palette textPalette = getNiasDarkPalette();
     // TODO: Serialize theme colors
